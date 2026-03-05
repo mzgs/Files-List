@@ -13,6 +13,7 @@ The scanner is parallel by default and optimized for large directory trees.
 - Hidden file control (`--no-hidden`)
 - CSV export (`--export-csv`)
 - Sorting and top-N (`--sort`, `--desc`, `--top`)
+- Folder total-size reporting (`--folders`, `--folders-only`)
 - Human-readable size output (`--human`)
 - Max-throughput streaming mode (`--fast`)
 
@@ -95,6 +96,8 @@ Options:
 | `--desc` | Descending sort order | ascending |
 | `--no-hidden` | Exclude hidden files | hidden files are included by default |
 | `--top N` | Keep only first `N` rows after sorting | none |
+| `--folders` | Include folders with recursive total sizes | off |
+| `--folders-only` | Show only folders with recursive total sizes | off |
 | `--exclude GLOB` | Exclude paths by glob (repeatable) | none |
 | `--exclude-cloud` | Exclude common macOS iCloud/Google Drive/Dropbox paths | off |
 | `--regex-filter REGEX` | Keep only matching paths | none |
@@ -150,6 +153,18 @@ Sort by path:
 ./target/release/files-list --path . --sort path
 ```
 
+Include folders with recursive totals alongside files:
+
+```bash
+./target/release/files-list --path . --folders
+```
+
+Show only folders with recursive totals:
+
+```bash
+./target/release/files-list --path . --folders-only --sort size --desc
+```
+
 Exclude hidden files:
 
 ```bash
@@ -197,6 +212,8 @@ Fast streaming mode:
 - `--top N` without `--sort` automatically uses `--sort size --desc`.
 - `--desc` requires `--sort` or `--top`.
 - `--fast` cannot be used with `--sort` or `--top`.
+- `--fast` cannot be used with `--folders` or `--folders-only`.
+- Folder rows are printed with a trailing `/` in the path column.
 - `--exclude-cloud` adds built-in excludes for common macOS cloud paths:
   - `.../Library/CloudStorage/GoogleDrive*`
   - `.../Library/CloudStorage/Dropbox*`

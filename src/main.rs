@@ -3,6 +3,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -77,6 +78,8 @@ struct Config {
     show_hidden: bool,
     top: Option<usize>,
     fast: bool,
+    include_folders: bool,
+    folders_only: bool,
     filters: Filters,
 }
 
@@ -89,6 +92,7 @@ enum OutputTarget {
 struct FileEntry {
     path: PathBuf,
     size: u64,
+    is_dir: bool,
 }
 
 enum ArgParse {
@@ -117,6 +121,8 @@ fn usage(bin: &str) -> String {
          --desc                 Descending sort\n\
          --no-hidden            Exclude hidden files\n\
          --top N                Keep first N results (defaults to size desc if no --sort)\n\
+         --folders              Include folders with recursive total sizes\n\
+         --folders-only         Show only folders with recursive total sizes\n\
          --exclude GLOB         Exclude paths by glob (repeatable)\n\
          --exclude-cloud        Exclude iCloud/Google Drive/Dropbox paths on macOS\n\
          --regex-filter REGEX   Keep paths that match REGEX\n\
@@ -246,6 +252,8 @@ fn parse_args() -> ArgParse {
     let mut desc_set = false;
     let mut show_hidden = true;
     let mut top: Option<usize> = None;
+    let mut include_folders = false;
+    let mut folders_only = false;
     let mut excludes: Vec<String> = Vec::new();
     let mut exclude_cloud = false;
     let mut fast = false;
@@ -436,6 +444,17 @@ fn parse_args() -> ArgParse {
             }
         }
 
+        if s == "--folders" {
+            include_folders = true;
+            continue;
+        }
+
+        if s == "--folders-only" {
+            folders_only = true;
+            include_folders = true;
+            continue;
+        }
+
         if s == "--exclude" {
             let Some(value) = args.next() else {
                 return ArgParse::Err("missing value for --exclude".to_string());
@@ -520,6 +539,10 @@ fn parse_args() -> ArgParse {
         return ArgParse::Err("--fast cannot be used with --sort or --top".to_string());
     }
 
+    if fast && include_folders {
+        return ArgParse::Err("--fast cannot be used with --folders or --folders-only".to_string());
+    }
+
     if exclude_cloud {
         excludes.extend(cloud_exclude_patterns());
     }
@@ -563,6 +586,8 @@ fn parse_args() -> ArgParse {
         show_hidden,
         top,
         fast,
+        include_folders,
+        folders_only,
         filters: Filters {
             min_size,
             max_size,
@@ -596,11 +621,19 @@ fn size_text(size: u64, human: bool) -> String {
     }
 }
 
+fn entry_path_text(entry: &FileEntry) -> String {
+    let mut text = entry.path.to_string_lossy().into_owned();
+    if entry.is_dir && !text.ends_with(std::path::MAIN_SEPARATOR) {
+        text.push(std::path::MAIN_SEPARATOR);
+    }
+    text
+}
+
 fn write_text_entry<W: Write>(out: &mut W, entry: &FileEntry, human: bool) -> io::Result<()> {
     writeln!(
         out,
         "{}\t{}",
-        entry.path.display(),
+        entry_path_text(entry),
         size_text(entry.size, human)
     )
 }
@@ -625,7 +658,7 @@ fn write_csv_field<W: Write>(out: &mut W, value: &str) -> io::Result<()> {
 }
 
 fn write_csv_entry<W: Write>(out: &mut W, entry: &FileEntry, human: bool) -> io::Result<()> {
-    let path_text = entry.path.to_string_lossy();
+    let path_text = entry_path_text(entry);
     let size = size_text(entry.size, human);
 
     write_csv_field(out, &path_text)?;
@@ -734,7 +767,14 @@ fn walk_send(
                 return WalkState::Continue;
             }
 
-            if tx.send(FileEntry { path, size }).is_err() {
+            if tx
+                .send(FileEntry {
+                    path,
+                    size,
+                    is_dir: false,
+                })
+                .is_err()
+            {
                 return WalkState::Quit;
             }
 
@@ -753,6 +793,44 @@ fn compare_entries(a: &FileEntry, b: &FileEntry, sort_key: SortKey, desc: bool) 
     } else {
         ord
     }
+}
+
+fn build_folder_totals(root: &Path, files: &[FileEntry], filters: &Filters) -> Vec<FileEntry> {
+    let mut totals: HashMap<PathBuf, u64> = HashMap::new();
+
+    for entry in files {
+        let mut current = entry.path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(root) {
+                break;
+            }
+
+            totals
+                .entry(dir.to_path_buf())
+                .and_modify(|total| *total = total.saturating_add(entry.size))
+                .or_insert(entry.size);
+
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+
+    totals
+        .into_iter()
+        .filter_map(|(path, size)| {
+            if filters.matches(&path, size) {
+                Some(FileEntry {
+                    path,
+                    size,
+                    is_dir: true,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn run_streaming(config: &Config) -> Result<(), String> {
@@ -795,6 +873,15 @@ fn run_sorted(config: &Config) -> Result<(), String> {
         Err(_) => return Err("collector thread panicked".to_string()),
     };
 
+    if config.include_folders {
+        let folder_entries = build_folder_totals(&config.path, &entries, &config.filters);
+        if config.folders_only {
+            entries = folder_entries;
+        } else {
+            entries.extend(folder_entries);
+        }
+    }
+
     if let Some(sort_key) = config.sort {
         entries.sort_unstable_by(|a, b| compare_entries(a, b, sort_key, config.desc));
     }
@@ -814,12 +901,17 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|err| format!("cannot access '{}': {err}", config.path.display()))?;
 
     if meta.is_file() {
+        if config.include_folders {
+            return Err("--folders and --folders-only require PATH to be a directory".to_string());
+        }
+
         let size = meta.len();
         let mut entries = Vec::new();
         if config.filters.matches(&config.path, size) {
             entries.push(FileEntry {
                 path: config.path.clone(),
                 size,
+                is_dir: false,
             });
         }
         write_all(&entries, config.human, &config.output)
@@ -834,7 +926,7 @@ fn run(config: Config) -> Result<(), String> {
         ));
     }
 
-    if config.sort.is_some() || config.top.is_some() {
+    if config.sort.is_some() || config.top.is_some() || config.include_folders {
         run_sorted(&config)
     } else {
         run_streaming(&config)
