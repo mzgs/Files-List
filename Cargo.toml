@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 crossbeam-channel = "0.5"
 ignore = "0.4"
+globset = "0.4"
+regex = "1"
