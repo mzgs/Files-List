@@ -26,6 +26,17 @@ struct Filters {
 }
 
 impl Filters {
+    fn is_excluded_path(&self, path: &Path) -> bool {
+        let path_text = path.to_string_lossy();
+        let normalized_path_text = path_text.strip_prefix("./").unwrap_or(&path_text);
+
+        if let Some(exclude_set) = &self.exclude_set {
+            exclude_set.is_match(path) || exclude_set.is_match(normalized_path_text)
+        } else {
+            false
+        }
+    }
+
     fn matches(&self, path: &Path, size: u64) -> bool {
         let path_text = path.to_string_lossy();
         let normalized_path_text = path_text.strip_prefix("./").unwrap_or(&path_text);
@@ -42,10 +53,8 @@ impl Filters {
             }
         }
 
-        if let Some(exclude_set) = &self.exclude_set {
-            if exclude_set.is_match(path) || exclude_set.is_match(normalized_path_text) {
-                return false;
-            }
+        if self.is_excluded_path(path) {
+            return false;
         }
 
         if let Some(regex_filter) = &self.regex_filter {
@@ -109,6 +118,7 @@ fn usage(bin: &str) -> String {
          --no-hidden            Exclude hidden files\n\
          --top N                Keep first N results (defaults to size desc if no --sort)\n\
          --exclude GLOB         Exclude paths by glob (repeatable)\n\
+         --exclude-cloud        Exclude iCloud/Google Drive/Dropbox paths on macOS\n\
          --regex-filter REGEX   Keep paths that match REGEX\n\
          --fast                 Stream output for max throughput (disables --sort/--top)\n\
          -h, --help             Show help\n\n\
@@ -178,6 +188,46 @@ fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("invalid {flag} value, expected integer > 0"))
 }
 
+fn cloud_exclude_patterns() -> Vec<String> {
+    let mut patterns = vec![
+        "/Volumes/GoogleDrive*".to_string(),
+        "/Volumes/GoogleDrive*/**".to_string(),
+        "/Volumes/Dropbox*".to_string(),
+        "/Volumes/Dropbox*/**".to_string(),
+        "/Volumes/iCloud*".to_string(),
+        "/Volumes/iCloud*/**".to_string(),
+        "**/Library/CloudStorage/GoogleDrive*".to_string(),
+        "**/Library/CloudStorage/GoogleDrive*/**".to_string(),
+        "**/Library/CloudStorage/Dropbox*".to_string(),
+        "**/Library/CloudStorage/Dropbox*/**".to_string(),
+        "**/Library/CloudStorage/iCloud*".to_string(),
+        "**/Library/CloudStorage/iCloud*/**".to_string(),
+        "**/Library/Mobile Documents/com~apple~CloudDocs".to_string(),
+        "**/Library/Mobile Documents/com~apple~CloudDocs/**".to_string(),
+    ];
+
+    if let Ok(home) = env::var("HOME") {
+        patterns.push(format!("{home}/Library/CloudStorage/GoogleDrive*"));
+        patterns.push(format!("{home}/Library/CloudStorage/GoogleDrive*/**"));
+        patterns.push(format!("{home}/Library/CloudStorage/Dropbox*"));
+        patterns.push(format!("{home}/Library/CloudStorage/Dropbox*/**"));
+        patterns.push(format!("{home}/Library/CloudStorage/iCloud*"));
+        patterns.push(format!("{home}/Library/CloudStorage/iCloud*/**"));
+        patterns.push(format!(
+            "{home}/Library/Mobile Documents/com~apple~CloudDocs"
+        ));
+        patterns.push(format!(
+            "{home}/Library/Mobile Documents/com~apple~CloudDocs/**"
+        ));
+        patterns.push(format!("{home}/Dropbox"));
+        patterns.push(format!("{home}/Dropbox/**"));
+        patterns.push(format!("{home}/Google Drive"));
+        patterns.push(format!("{home}/Google Drive/**"));
+    }
+
+    patterns
+}
+
 fn parse_args() -> ArgParse {
     let mut args = env::args_os();
     let bin = args
@@ -197,6 +247,7 @@ fn parse_args() -> ArgParse {
     let mut show_hidden = true;
     let mut top: Option<usize> = None;
     let mut excludes: Vec<String> = Vec::new();
+    let mut exclude_cloud = false;
     let mut fast = false;
     let mut regex_filter: Option<String> = None;
 
@@ -401,6 +452,11 @@ fn parse_args() -> ArgParse {
             continue;
         }
 
+        if s == "--exclude-cloud" {
+            exclude_cloud = true;
+            continue;
+        }
+
         if let Some(value) = s.strip_prefix("--exclude=") {
             let mut found = false;
             for pattern in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -464,6 +520,10 @@ fn parse_args() -> ArgParse {
         return ArgParse::Err("--fast cannot be used with --sort or --top".to_string());
     }
 
+    if exclude_cloud {
+        excludes.extend(cloud_exclude_patterns());
+    }
+
     let exclude_set = if excludes.is_empty() {
         None
     } else {
@@ -495,7 +555,9 @@ fn parse_args() -> ArgParse {
         path: path.unwrap_or_else(|| PathBuf::from(".")),
         threads: threads.unwrap_or_else(default_threads),
         human,
-        output: export_csv.map(OutputTarget::Csv).unwrap_or(OutputTarget::Stdout),
+        output: export_csv
+            .map(OutputTarget::Csv)
+            .unwrap_or(OutputTarget::Stdout),
         sort,
         desc,
         show_hidden,
@@ -535,11 +597,18 @@ fn size_text(size: u64, human: bool) -> String {
 }
 
 fn write_text_entry<W: Write>(out: &mut W, entry: &FileEntry, human: bool) -> io::Result<()> {
-    writeln!(out, "{}\t{}", entry.path.display(), size_text(entry.size, human))
+    writeln!(
+        out,
+        "{}\t{}",
+        entry.path.display(),
+        size_text(entry.size, human)
+    )
 }
 
 fn write_csv_field<W: Write>(out: &mut W, value: &str) -> io::Result<()> {
-    let needs_quotes = value.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    let needs_quotes = value
+        .bytes()
+        .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
     if !needs_quotes {
         return out.write_all(value.as_bytes());
     }
@@ -641,6 +710,15 @@ fn walk_send(
                 Ok(dent) => dent,
                 Err(_) => return WalkState::Continue,
             };
+
+            let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if filters.is_excluded_path(dent.path()) {
+                return if is_dir {
+                    WalkState::Skip
+                } else {
+                    WalkState::Continue
+                };
+            }
 
             if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 return WalkState::Continue;

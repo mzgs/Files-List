@@ -9,6 +9,7 @@ The scanner is parallel by default and optimized for large directory trees.
 - Parallel filesystem traversal (`--threads auto|N`)
 - File size filters (`--min-size`, `--max-size`)
 - Path filters (`--exclude` glob, `--regex-filter`)
+- Cloud mount exclusion (`--exclude-cloud` for iCloud/Google Drive/Dropbox)
 - Hidden file control (`--no-hidden`)
 - CSV export (`--export-csv`)
 - Sorting and top-N (`--sort`, `--desc`, `--top`)
@@ -95,6 +96,7 @@ Options:
 | `--no-hidden` | Exclude hidden files | hidden files are included by default |
 | `--top N` | Keep only first `N` rows after sorting | none |
 | `--exclude GLOB` | Exclude paths by glob (repeatable) | none |
+| `--exclude-cloud` | Exclude common macOS iCloud/Google Drive/Dropbox paths | off |
 | `--regex-filter REGEX` | Keep only matching paths | none |
 | `--fast` | Stream output for max throughput | off |
 | `-h`, `--help` | Show help | n/a |
@@ -163,6 +165,12 @@ Exclude multiple path patterns:
   --exclude '**/*.log'
 ```
 
+Exclude common cloud-synced/mounted locations on macOS:
+
+```bash
+./target/release/files-list --path . --exclude-cloud
+```
+
 Use regex path filter:
 
 ```bash
@@ -189,6 +197,12 @@ Fast streaming mode:
 - `--top N` without `--sort` automatically uses `--sort size --desc`.
 - `--desc` requires `--sort` or `--top`.
 - `--fast` cannot be used with `--sort` or `--top`.
+- `--exclude-cloud` adds built-in excludes for common macOS cloud paths:
+  - `.../Library/CloudStorage/GoogleDrive*`
+  - `.../Library/CloudStorage/Dropbox*`
+  - `.../Library/CloudStorage/iCloud*`
+  - `.../Library/Mobile Documents/com~apple~CloudDocs`
+  - `/Volumes/GoogleDrive*`, `/Volumes/Dropbox*`, `/Volumes/iCloud*`
 - If `--min-size` is larger than `--max-size`, command fails.
 
 ## Exit Codes
