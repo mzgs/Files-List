@@ -10,6 +10,7 @@ The scanner is parallel by default and optimized for large directory trees.
 - File size filters (`--min-size`, `--max-size`)
 - Path filters (`--exclude` glob, `--regex-filter`)
 - Hidden file control (`--no-hidden`)
+- CSV export (`--export-csv`)
 - Sorting and top-N (`--sort`, `--desc`, `--top`)
 - Human-readable size output (`--human`)
 - Max-throughput streaming mode (`--fast`)
@@ -42,7 +43,7 @@ Or with positional path:
 
 ## Output Format
 
-Default output is tab-separated:
+Default stdout output is tab-separated:
 
 ```text
 <path>\t<size>
@@ -62,6 +63,15 @@ With `--human`, size becomes human-readable:
 ./README.md	4.02 KiB
 ```
 
+With `--export-csv`, output is written to CSV and nothing is printed to terminal.
+CSV format:
+
+```text
+path,size
+./src/main.rs,20137
+./README.md,4120
+```
+
 ## CLI Reference
 
 Usage:
@@ -77,6 +87,7 @@ Options:
 | `--path PATH` | Path to scan (same as positional `PATH`) | `.` |
 | `--threads auto\|N` | Worker thread count | `auto` |
 | `--human` | Print human-readable sizes | off |
+| `--export-csv FILE` | Write results to CSV file (no stdout output) | none |
 | `--min-size SIZE` | Include only files `>= SIZE` | none |
 | `--max-size SIZE` | Include only files `<= SIZE` | none |
 | `--sort size\|path` | Sort output by key | none |
@@ -111,6 +122,12 @@ Show human-readable sizes:
 
 ```bash
 ./target/release/files-list --path . --human
+```
+
+Export to CSV (no terminal output):
+
+```bash
+./target/release/files-list --path . --export-csv files.csv
 ```
 
 Filter by size range:
@@ -168,6 +185,7 @@ Fast streaming mode:
 ## Behavior Notes
 
 - Hidden files are included by default.
+- `--export-csv FILE` writes to CSV and suppresses stdout output.
 - `--top N` without `--sort` automatically uses `--sort size --desc`.
 - `--desc` requires `--sort` or `--top`.
 - `--fast` cannot be used with `--sort` or `--top`.

@@ -4,7 +4,7 @@ use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -62,12 +62,19 @@ struct Config {
     path: PathBuf,
     threads: usize,
     human: bool,
+    output: OutputTarget,
     sort: Option<SortKey>,
     desc: bool,
     show_hidden: bool,
     top: Option<usize>,
     fast: bool,
     filters: Filters,
+}
+
+#[derive(Clone)]
+enum OutputTarget {
+    Stdout,
+    Csv(PathBuf),
 }
 
 struct FileEntry {
@@ -94,6 +101,7 @@ fn usage(bin: &str) -> String {
          --path PATH            Path to scan (same as positional PATH)\n\
          --threads auto|N       Worker count (default: auto)\n\
          --human                Print human-readable sizes\n\
+         --export-csv FILE      Export result to CSV file (no stdout output)\n\
          --min-size SIZE        Include only files >= SIZE\n\
          --max-size SIZE        Include only files <= SIZE\n\
          --sort size|path       Sort output\n\
@@ -105,7 +113,7 @@ fn usage(bin: &str) -> String {
          --fast                 Stream output for max throughput (disables --sort/--top)\n\
          -h, --help             Show help\n\n\
          SIZE suffixes: B, KB, MB, GB, TB, PB (also KiB/MiB/GiB/TiB/PiB)\n\
-         Output format: <path>\\t<size>"
+         Stdout output format: <path>\\t<size>"
     )
 }
 
@@ -180,6 +188,7 @@ fn parse_args() -> ArgParse {
     let mut path: Option<PathBuf> = None;
     let mut threads: Option<usize> = None;
     let mut human = false;
+    let mut export_csv: Option<PathBuf> = None;
     let mut min_size: Option<u64> = None;
     let mut max_size: Option<u64> = None;
     let mut sort: Option<SortKey> = None;
@@ -244,6 +253,32 @@ fn parse_args() -> ArgParse {
 
         if s == "--human" {
             human = true;
+            continue;
+        }
+
+        if s == "--export-csv" {
+            let Some(value) = args.next() else {
+                return ArgParse::Err("missing value for --export-csv".to_string());
+            };
+            let value = value.to_string_lossy();
+            if value.trim().is_empty() {
+                return ArgParse::Err("empty value for --export-csv".to_string());
+            }
+            if export_csv.is_some() {
+                return ArgParse::Err("--export-csv provided multiple times".to_string());
+            }
+            export_csv = Some(PathBuf::from(value.as_ref()));
+            continue;
+        }
+
+        if let Some(value) = s.strip_prefix("--export-csv=") {
+            if value.trim().is_empty() {
+                return ArgParse::Err("empty value for --export-csv".to_string());
+            }
+            if export_csv.is_some() {
+                return ArgParse::Err("--export-csv provided multiple times".to_string());
+            }
+            export_csv = Some(PathBuf::from(value));
             continue;
         }
 
@@ -460,6 +495,7 @@ fn parse_args() -> ArgParse {
         path: path.unwrap_or_else(|| PathBuf::from(".")),
         threads: threads.unwrap_or_else(default_threads),
         human,
+        output: export_csv.map(OutputTarget::Csv).unwrap_or(OutputTarget::Stdout),
         sort,
         desc,
         show_hidden,
@@ -490,46 +526,98 @@ fn human_size(size: u64) -> String {
     format!("{value:.2} {}", UNITS[unit])
 }
 
-fn write_entry(
-    out: &mut BufWriter<io::StdoutLock<'_>>,
-    entry: &FileEntry,
-    human: bool,
-) -> io::Result<()> {
+fn size_text(size: u64, human: bool) -> String {
     if human {
-        writeln!(out, "{}\t{}", entry.path.display(), human_size(entry.size))
+        human_size(size)
     } else {
-        writeln!(out, "{}\t{}", entry.path.display(), entry.size)
+        size.to_string()
     }
 }
 
-fn write_single_file(path: &Path, size: u64, human: bool) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
-    let entry = FileEntry {
-        path: path.to_path_buf(),
-        size,
-    };
-    write_entry(&mut out, &entry, human)?;
-    out.flush()
+fn write_text_entry<W: Write>(out: &mut W, entry: &FileEntry, human: bool) -> io::Result<()> {
+    writeln!(out, "{}\t{}", entry.path.display(), size_text(entry.size, human))
 }
 
-fn write_stream(rx: Receiver<FileEntry>, human: bool, fast: bool) -> io::Result<()> {
-    let stdout = io::stdout();
+fn write_csv_field<W: Write>(out: &mut W, value: &str) -> io::Result<()> {
+    let needs_quotes = value.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    if !needs_quotes {
+        return out.write_all(value.as_bytes());
+    }
+
+    out.write_all(b"\"")?;
+    for ch in value.chars() {
+        if ch == '"' {
+            out.write_all(b"\"\"")?;
+        } else {
+            write!(out, "{ch}")?;
+        }
+    }
+    out.write_all(b"\"")
+}
+
+fn write_csv_entry<W: Write>(out: &mut W, entry: &FileEntry, human: bool) -> io::Result<()> {
+    let path_text = entry.path.to_string_lossy();
+    let size = size_text(entry.size, human);
+
+    write_csv_field(out, &path_text)?;
+    out.write_all(b",")?;
+    write_csv_field(out, &size)?;
+    out.write_all(b"\n")
+}
+
+fn write_csv_header<W: Write>(out: &mut W) -> io::Result<()> {
+    out.write_all(b"path,size\n")
+}
+
+fn write_stream(
+    rx: Receiver<FileEntry>,
+    human: bool,
+    fast: bool,
+    output: OutputTarget,
+) -> io::Result<()> {
     let buffer_size = if fast { 1 << 22 } else { 1 << 20 };
-    let mut out = BufWriter::with_capacity(buffer_size, stdout.lock());
-    for entry in rx {
-        write_entry(&mut out, &entry, human)?;
+
+    match output {
+        OutputTarget::Stdout => {
+            let stdout = io::stdout();
+            let mut out = BufWriter::with_capacity(buffer_size, stdout.lock());
+            for entry in rx {
+                write_text_entry(&mut out, &entry, human)?;
+            }
+            out.flush()
+        }
+        OutputTarget::Csv(path) => {
+            let file = File::create(&path)?;
+            let mut out = BufWriter::with_capacity(buffer_size, file);
+            write_csv_header(&mut out)?;
+            for entry in rx {
+                write_csv_entry(&mut out, &entry, human)?;
+            }
+            out.flush()
+        }
     }
-    out.flush()
 }
 
-fn write_all(entries: &[FileEntry], human: bool) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
-    for entry in entries {
-        write_entry(&mut out, entry, human)?;
+fn write_all(entries: &[FileEntry], human: bool, output: &OutputTarget) -> io::Result<()> {
+    match output {
+        OutputTarget::Stdout => {
+            let stdout = io::stdout();
+            let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
+            for entry in entries {
+                write_text_entry(&mut out, entry, human)?;
+            }
+            out.flush()
+        }
+        OutputTarget::Csv(path) => {
+            let file = File::create(path)?;
+            let mut out = BufWriter::with_capacity(1 << 20, file);
+            write_csv_header(&mut out)?;
+            for entry in entries {
+                write_csv_entry(&mut out, entry, human)?;
+            }
+            out.flush()
+        }
     }
-    out.flush()
 }
 
 fn walk_send(
@@ -594,7 +682,8 @@ fn run_streaming(config: &Config) -> Result<(), String> {
     let (tx, rx) = bounded::<FileEntry>(channel_size);
     let human = config.human;
     let fast = config.fast;
-    let writer_handle = thread::spawn(move || write_stream(rx, human, fast));
+    let output = config.output.clone();
+    let writer_handle = thread::spawn(move || write_stream(rx, human, fast, output));
 
     walk_send(
         &config.path,
@@ -638,7 +727,8 @@ fn run_sorted(config: &Config) -> Result<(), String> {
         }
     }
 
-    write_all(&entries, config.human).map_err(|err| format!("failed to write output: {err}"))
+    write_all(&entries, config.human, &config.output)
+        .map_err(|err| format!("failed to write output: {err}"))
 }
 
 fn run(config: Config) -> Result<(), String> {
@@ -647,10 +737,15 @@ fn run(config: Config) -> Result<(), String> {
 
     if meta.is_file() {
         let size = meta.len();
+        let mut entries = Vec::new();
         if config.filters.matches(&config.path, size) {
-            write_single_file(&config.path, size, config.human)
-                .map_err(|err| format!("failed to write output: {err}"))?;
+            entries.push(FileEntry {
+                path: config.path.clone(),
+                size,
+            });
         }
+        write_all(&entries, config.human, &config.output)
+            .map_err(|err| format!("failed to write output: {err}"))?;
         return Ok(());
     }
 
