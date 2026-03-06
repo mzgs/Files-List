@@ -7,6 +7,7 @@ The scanner is parallel by default and optimized for large directory trees.
 ## Features
 
 - Parallel filesystem traversal (`--threads auto|N`)
+- Traversal depth limit (`--depth N`)
 - File size filters (`--min-size`, `--max-size`)
 - Path filters (`--exclude` glob, `--regex-filter`)
 - Cloud mount exclusion (`--exclude-cloud` for iCloud/Google Drive/Dropbox)
@@ -88,6 +89,7 @@ Options:
 |---|---|---|
 | `--path PATH` | Path to scan (same as positional `PATH`) | `.` |
 | `--threads auto\|N` | Worker thread count | `auto` |
+| `--depth N` | Max depth (`1` = direct children); with `--folders-only`, limits folder output depth | unlimited |
 | `--human` | Print human-readable sizes | off |
 | `--export-csv FILE` | Write results to CSV file (no stdout output) | none |
 | `--min-size SIZE` | Include only files `>= SIZE` | none |
@@ -199,6 +201,12 @@ Control parallelism:
 ./target/release/files-list --path . --threads 16
 ```
 
+Limit traversal depth:
+
+```bash
+./target/release/files-list --path . --depth 2
+```
+
 Fast streaming mode:
 
 ```bash
@@ -208,6 +216,8 @@ Fast streaming mode:
 ## Behavior Notes
 
 - Hidden files are included by default.
+- `--depth N` limits recursion depth (`1` means only direct children of `PATH`).
+- With `--folders-only`, `--depth N` limits which folder levels are printed, while folder sizes remain recursive totals.
 - `--export-csv FILE` writes to CSV and suppresses stdout output.
 - `--top N` without `--sort` automatically uses `--sort size --desc`.
 - `--desc` requires `--sort` or `--top`.

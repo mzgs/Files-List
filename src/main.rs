@@ -3,7 +3,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -71,6 +71,7 @@ impl Filters {
 struct Config {
     path: PathBuf,
     threads: usize,
+    depth: Option<usize>,
     human: bool,
     output: OutputTarget,
     sort: Option<SortKey>,
@@ -95,6 +96,11 @@ struct FileEntry {
     is_dir: bool,
 }
 
+enum ScannedEntry {
+    File(FileEntry),
+    Dir(PathBuf),
+}
+
 enum ArgParse {
     Ok(Config),
     Help,
@@ -113,6 +119,7 @@ fn usage(bin: &str) -> String {
          Options:\n\
          --path PATH            Path to scan (same as positional PATH)\n\
          --threads auto|N       Worker count (default: auto)\n\
+         --depth N              Max depth (1 = direct children; with --folders-only, limits folder output depth)\n\
          --human                Print human-readable sizes\n\
          --export-csv FILE      Export result to CSV file (no stdout output)\n\
          --min-size SIZE        Include only files >= SIZE\n\
@@ -243,6 +250,7 @@ fn parse_args() -> ArgParse {
 
     let mut path: Option<PathBuf> = None;
     let mut threads: Option<usize> = None;
+    let mut depth: Option<usize> = None;
     let mut human = false;
     let mut export_csv: Option<PathBuf> = None;
     let mut min_size: Option<u64> = None;
@@ -304,6 +312,29 @@ fn parse_args() -> ArgParse {
             match parse_threads(value) {
                 Ok(n) => {
                     threads = Some(n);
+                    continue;
+                }
+                Err(err) => return ArgParse::Err(err),
+            }
+        }
+
+        if s == "--depth" {
+            let Some(value) = args.next() else {
+                return ArgParse::Err("missing value for --depth".to_string());
+            };
+            match parse_positive_usize(&value.to_string_lossy(), "--depth") {
+                Ok(n) => {
+                    depth = Some(n);
+                    continue;
+                }
+                Err(err) => return ArgParse::Err(err),
+            }
+        }
+
+        if let Some(value) = s.strip_prefix("--depth=") {
+            match parse_positive_usize(value, "--depth") {
+                Ok(n) => {
+                    depth = Some(n);
                     continue;
                 }
                 Err(err) => return ArgParse::Err(err),
@@ -577,6 +608,7 @@ fn parse_args() -> ArgParse {
     ArgParse::Ok(Config {
         path: path.unwrap_or_else(|| PathBuf::from(".")),
         threads: threads.unwrap_or_else(default_threads),
+        depth,
         human,
         output: export_csv
             .map(OutputTarget::Csv)
@@ -725,6 +757,7 @@ fn write_all(entries: &[FileEntry], human: bool, output: &OutputTarget) -> io::R
 fn walk_send(
     root: &Path,
     threads: usize,
+    depth: Option<usize>,
     show_hidden: bool,
     filters: Arc<Filters>,
     tx: Sender<FileEntry>,
@@ -733,6 +766,7 @@ fn walk_send(
     builder.standard_filters(false);
     builder.hidden(!show_hidden);
     builder.threads(threads);
+    builder.max_depth(depth);
 
     let walker = builder.build_parallel();
     walker.run(move || {
@@ -783,6 +817,79 @@ fn walk_send(
     });
 }
 
+fn walk_send_with_dirs(
+    root: &Path,
+    threads: usize,
+    depth: Option<usize>,
+    show_hidden: bool,
+    filters: Arc<Filters>,
+    tx: Sender<ScannedEntry>,
+) {
+    let mut builder = WalkBuilder::new(root);
+    builder.standard_filters(false);
+    builder.hidden(!show_hidden);
+    builder.threads(threads);
+    builder.max_depth(depth);
+
+    let walker = builder.build_parallel();
+    walker.run(move || {
+        let tx = tx.clone();
+        let filters = Arc::clone(&filters);
+        Box::new(move |entry| {
+            let dent = match entry {
+                Ok(dent) => dent,
+                Err(_) => return WalkState::Continue,
+            };
+
+            let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if filters.is_excluded_path(dent.path()) {
+                return if is_dir {
+                    WalkState::Skip
+                } else {
+                    WalkState::Continue
+                };
+            }
+
+            if is_dir {
+                if tx
+                    .send(ScannedEntry::Dir(dent.path().to_path_buf()))
+                    .is_err()
+                {
+                    return WalkState::Quit;
+                }
+                return WalkState::Continue;
+            }
+
+            if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+
+            let size = match dent.metadata() {
+                Ok(meta) => meta.len(),
+                Err(_) => return WalkState::Continue,
+            };
+
+            let path = dent.into_path();
+            if !filters.matches(&path, size) {
+                return WalkState::Continue;
+            }
+
+            if tx
+                .send(ScannedEntry::File(FileEntry {
+                    path,
+                    size,
+                    is_dir: false,
+                }))
+                .is_err()
+            {
+                return WalkState::Quit;
+            }
+
+            WalkState::Continue
+        })
+    });
+}
+
 fn compare_entries(a: &FileEntry, b: &FileEntry, sort_key: SortKey, desc: bool) -> Ordering {
     let ord = match sort_key {
         SortKey::Size => a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path)),
@@ -795,31 +902,77 @@ fn compare_entries(a: &FileEntry, b: &FileEntry, sort_key: SortKey, desc: bool) 
     }
 }
 
-fn build_folder_totals(root: &Path, files: &[FileEntry], filters: &Filters) -> Vec<FileEntry> {
-    let mut totals: HashMap<PathBuf, u64> = HashMap::new();
+fn path_depth_from_root(root: &Path, path: &Path) -> Option<usize> {
+    path.strip_prefix(root).ok().map(|p| p.components().count())
+}
+
+fn build_folder_totals(
+    root: &Path,
+    files: &[FileEntry],
+    dirs: Vec<PathBuf>,
+    folder_depth_limit: Option<usize>,
+    filters: &Filters,
+) -> Vec<FileEntry> {
+    let mut dir_set: HashSet<PathBuf> = dirs.into_iter().collect();
+    dir_set.insert(root.to_path_buf());
+
+    let mut totals: HashMap<PathBuf, u64> = dir_set.iter().cloned().map(|dir| (dir, 0)).collect();
 
     for entry in files {
-        let mut current = entry.path.parent();
-        while let Some(dir) = current {
-            if !dir.starts_with(root) {
-                break;
-            }
-
-            totals
-                .entry(dir.to_path_buf())
-                .and_modify(|total| *total = total.saturating_add(entry.size))
-                .or_insert(entry.size);
-
-            if dir == root {
-                break;
-            }
-            current = dir.parent();
+        let Some(parent) = entry.path.parent() else {
+            continue;
+        };
+        if !parent.starts_with(root) {
+            continue;
         }
+        if !totals.contains_key(parent) {
+            continue;
+        }
+
+        let parent = parent.to_path_buf();
+        totals
+            .entry(parent.clone())
+            .and_modify(|total| *total = total.saturating_add(entry.size))
+            .or_insert(entry.size);
+    }
+
+    let mut ordered_dirs: Vec<PathBuf> = totals.keys().cloned().collect();
+    ordered_dirs.sort_unstable_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| a.cmp(b))
+    });
+
+    for dir in ordered_dirs {
+        let subtotal = totals.get(&dir).copied().unwrap_or(0);
+
+        let Some(parent) = dir.parent() else {
+            continue;
+        };
+        if !parent.starts_with(root) {
+            continue;
+        }
+        if !totals.contains_key(parent) {
+            continue;
+        }
+
+        let parent = parent.to_path_buf();
+        totals
+            .entry(parent.clone())
+            .and_modify(|total| *total = total.saturating_add(subtotal))
+            .or_insert(subtotal);
     }
 
     totals
         .into_iter()
         .filter_map(|(path, size)| {
+            if let Some(limit) = folder_depth_limit {
+                let depth = path_depth_from_root(root, &path)?;
+                if depth > limit {
+                    return None;
+                }
+            }
             if filters.matches(&path, size) {
                 Some(FileEntry {
                     path,
@@ -844,6 +997,7 @@ fn run_streaming(config: &Config) -> Result<(), String> {
     walk_send(
         &config.path,
         config.threads,
+        config.depth,
         config.show_hidden,
         Arc::new(config.filters.clone()),
         tx,
@@ -857,24 +1011,71 @@ fn run_streaming(config: &Config) -> Result<(), String> {
 }
 
 fn run_sorted(config: &Config) -> Result<(), String> {
-    let (tx, rx) = bounded::<FileEntry>(16_384);
-    let collect_handle = thread::spawn(move || rx.into_iter().collect::<Vec<FileEntry>>());
-
-    walk_send(
-        &config.path,
-        config.threads,
-        config.show_hidden,
-        Arc::new(config.filters.clone()),
-        tx,
-    );
-
-    let mut entries = match collect_handle.join() {
-        Ok(entries) => entries,
-        Err(_) => return Err("collector thread panicked".to_string()),
-    };
+    let mut entries: Vec<FileEntry>;
+    let mut folder_dirs: Vec<PathBuf> = Vec::new();
 
     if config.include_folders {
-        let folder_entries = build_folder_totals(&config.path, &entries, &config.filters);
+        let (tx, rx) = bounded::<ScannedEntry>(16_384);
+        let collect_handle = thread::spawn(move || {
+            let mut files = Vec::new();
+            let mut dirs = Vec::new();
+            for entry in rx {
+                match entry {
+                    ScannedEntry::File(file) => files.push(file),
+                    ScannedEntry::Dir(dir) => dirs.push(dir),
+                }
+            }
+            (files, dirs)
+        });
+
+        walk_send_with_dirs(
+            &config.path,
+            config.threads,
+            if config.folders_only {
+                None
+            } else {
+                config.depth
+            },
+            config.show_hidden,
+            Arc::new(config.filters.clone()),
+            tx,
+        );
+
+        (entries, folder_dirs) = match collect_handle.join() {
+            Ok(collected) => collected,
+            Err(_) => return Err("collector thread panicked".to_string()),
+        };
+    } else {
+        let (tx, rx) = bounded::<FileEntry>(16_384);
+        let collect_handle = thread::spawn(move || rx.into_iter().collect::<Vec<FileEntry>>());
+
+        walk_send(
+            &config.path,
+            config.threads,
+            config.depth,
+            config.show_hidden,
+            Arc::new(config.filters.clone()),
+            tx,
+        );
+
+        entries = match collect_handle.join() {
+            Ok(entries) => entries,
+            Err(_) => return Err("collector thread panicked".to_string()),
+        };
+    }
+
+    if config.include_folders {
+        let folder_entries = build_folder_totals(
+            &config.path,
+            &entries,
+            folder_dirs,
+            if config.folders_only {
+                config.depth
+            } else {
+                None
+            },
+            &config.filters,
+        );
         if config.folders_only {
             entries = folder_entries;
         } else {
